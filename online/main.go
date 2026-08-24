@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const platformArch = "linux-x64"
@@ -55,10 +55,37 @@ func trimSlash(s string) string {
 	return strings.TrimRight(s, "/")
 }
 
+func pathSegmentUnreserved(c byte) bool {
+	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') ||
+		c == '-' || c == '.' || c == '_' || c == '~'
+}
+
+// encodePath 对 manifest artifactPath 做 RFC 3986 path-segment 编码。
+// 仅保留 unreserved（A-Z a-z 0-9 - . _ ~），其余字节一律 %XX。
+// Go 的 url.PathEscape 会保留 + 等 sub-delims，OSS/CDN 对象名需严格编码。
 func encodePath(p string) string {
 	parts := strings.Split(p, "/")
 	for i, seg := range parts {
-		parts[i] = url.PathEscape(seg)
+		var b strings.Builder
+		for j := 0; j < len(seg); {
+			c := seg[j]
+			if pathSegmentUnreserved(c) {
+				b.WriteByte(c)
+				j++
+				continue
+			}
+			r, size := utf8.DecodeRuneInString(seg[j:])
+			if r == utf8.RuneError && size == 1 {
+				b.WriteString(fmt.Sprintf("%%%02X", c))
+				j++
+				continue
+			}
+			for _, by := range []byte(seg[j : j+size]) {
+				b.WriteString(fmt.Sprintf("%%%02X", by))
+			}
+			j += size
+		}
+		parts[i] = b.String()
 	}
 	return strings.Join(parts, "/")
 }
