@@ -2,6 +2,8 @@
 ## 项目用途
 ZCode 连接 SSH 远程（linux-x64）时，需要在线从 CDN 拉取 `manifest` 与组件包（`server-bundle` / `node-runtime` 等），再部署到远程主机。
 
+从 **3.16.1** 起，清单改为 `source-server-release.json`，资源改为完整的 `zcode-server-linux-x64.tar.gz`。本项目兼容新旧两种格式；例如在 `online/` 中执行 `go run . -version 3.16.3`，再在 `offline/` 中执行 `go run .`。已发布的旧版下载器需要重新构建或升级到包含此修复的版本。
+
 本项目解决**离线环境** 的环境中，ZCode 无法连CDN拉取，ssh连接远程服务器进行开发的问题。
 
 本仓库做两件事：
@@ -36,7 +38,7 @@ ZCode 连接 SSH 远程（linux-x64）时，需要在线从 CDN 拉取 `manifest
 # Linux 示例
 chmod +x download-offline-assets_linux_amd64
 ./download-offline-assets_linux_amd64 -list
-./download-offline-assets_linux_amd64 -version 3.4.2
+./download-offline-assets_linux_amd64 -version 3.16.3
 ```
 
 资源写入 `offline/zcode/electron/releases/...`。

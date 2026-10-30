@@ -13,6 +13,10 @@
 
 安装版连接 SSH 远程时会：
 
+**3.16.1 及以后版本**请求 `<version>/source-server-release.json`，选择目标平台的 archive，再下载同版本目录中的完整 server 包。离线目录需同时包含清单和 `zcode-server-linux-x64.tar.gz`。
+
+**旧版本**使用以下组件流程：
+
 1. 请求 CDN 上的 `manifest-linux-x64.json`
 2. 按 manifest 下载组件包（`server-bundle` / `node-runtime` / `node-pty` / `glm` / `ripgrep`）
 3. 解压到本机 `%APPDATA%\ZCode\remote-assets-cache`
@@ -42,6 +46,9 @@ offline/
     │   └── manifest-linux-x64.json
     ├── 3.5.0/                         ← 可并存多个版本
     │   └── manifest-linux-x64.json
+    ├── 3.16.3/
+    │   ├── source-server-release.json
+    │   └── zcode-server-linux-x64.tar.gz
     └── components/linux-x64/
         └── <id>/<version>.tar.gz
 ```
@@ -50,8 +57,10 @@ offline/
 
 | 资源 | URL 形态 |
 |------|----------|
-| 清单文件 | `{CDN}/<version>/manifest-linux-x64.json` |
-| 组件包 | `{CDN}/components/linux-x64/<id>/<version>.tar.gz` |
+| 新版清单 | `{CDN}/<version>/source-server-release.json` |
+| 新版完整包 | `{CDN}/<version>/zcode-server-linux-x64.tar.gz` |
+| 旧版清单 | `{CDN}/<version>/manifest-linux-x64.json` |
+| 旧版组件包 | `{CDN}/components/linux-x64/<id>/<version>.tar.gz` |
 
 其中 `{CDN}` 默认可理解为：`https://cdn-zcode.z.ai/zcode/electron/releases`
 
@@ -83,6 +92,7 @@ PORT=9000 BIND=0.0.0.0 ./zcode-cdn-mock_linux_amd64
 | `http://127.0.0.1:8765/` | 首页，列出已发现版本 |
 | `http://127.0.0.1:8765/versions.json` | 机器可读版本列表（每次请求扫描目录） |
 | `http://127.0.0.1:8765/healthz` | 健康检查 |
+| `http://127.0.0.1:8765/zcode/electron/releases/3.16.3/source-server-release.json` | 新版清单 |
 | `http://127.0.0.1:8765/zcode/electron/releases/3.4.2/manifest-linux-x64.json` | 某版本清单 |
 
 ### 多版本自动响应
@@ -215,7 +225,12 @@ Get-FileHash -Algorithm SHA256 .\zcode\electron\releases\components\linux-x64\*\
   Format-Table Hash, Path -AutoSize
 ```
 
-对照 `sha256sums-linux-x64.txt`。清单中的哈希与 manifest 里各组件的 `sha256` 字段一致。
+对照 `sha256sums-linux-x64.txt`。清单中的哈希来自旧版 `components[].sha256` 或新版 `archives[].sha256`。新版完整包放在版本目录下，不在 `components/` 下；Linux 可执行：
+
+```bash
+cd zcode/electron/releases
+sha256sum -c ../../../sha256sums-linux-x64.txt
+```
 
 ---
 

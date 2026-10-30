@@ -4,7 +4,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,10 +38,13 @@ var (
 )
 
 type component struct {
-	ID           string `json:"id"`
-	Version      string `json:"version"`
-	Sha256       string `json:"sha256"`
-	ArtifactPath string `json:"artifactPath"`
+	ID            string   `json:"id"`
+	Version       string   `json:"version"`
+	Sha256        string   `json:"sha256"`
+	ArtifactPath  string   `json:"artifactPath"`
+	SizeBytes     int64    `json:"-"`
+	URLs          []string `json:"-"`
+	SourceVersion string   `json:"-"`
 }
 
 type manifest struct {
@@ -144,9 +147,10 @@ func detectDefaultVersion(releasesRoot string) string {
 		return versionLess(versions[j], versions[i])
 	})
 	for _, ver := range versions {
-		mp := filepath.Join(releasesRoot, ver, "manifest-"+platformArch+".json")
-		if _, err := os.Stat(mp); err == nil {
-			return ver
+		for _, name := range manifestNames {
+			if _, err := os.Stat(filepath.Join(releasesRoot, ver, name)); err == nil {
+				return ver
+			}
 		}
 	}
 	if len(versions) > 0 {
@@ -186,110 +190,77 @@ func fetchOK(client *http.Client, rawURL string) (*http.Response, error) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, &httpStatusError{URL: rawURL, Status: resp.StatusCode}
 	}
 	return resp, nil
 }
 
-func headOK(client *http.Client, rawURL string) bool {
-	req, err := http.NewRequest(http.MethodHead, rawURL, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return true
-	}
-	// 部分 CDN 对 HEAD 不友好，回退 GET
-	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusForbidden {
-		r2, err := fetchOK(client, rawURL)
-		if err != nil {
-			return false
-		}
-		_ = r2.Body.Close()
-		return true
-	}
-	return false
+type httpStatusError struct {
+	URL    string
+	Status int
 }
 
-func latestFeedURL(cdnBase string) string {
-	return trimSlash(cdnBase) + "/update/linux/x64/latest-linux.yml"
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d", e.URL, e.Status)
 }
 
-func resolveCDNBase(client *http.Client, preferred string) (string, error) {
+func isNotFound(err error) bool {
+	var status *httpStatusError
+	return errors.As(err, &status) && (status.Status == http.StatusNotFound || status.Status == http.StatusGone)
+}
+
+func cdnCandidates(preferred string) []string {
 	if preferred != "" {
-		preferred = trimSlash(preferred)
-		if headOK(client, latestFeedURL(preferred)) || headOK(client, preferred+"/3.4.2/manifest-"+platformArch+".json") {
-			fmt.Println("CDN 可用（指定）：", preferred)
-			return preferred, nil
-		}
-		return "", fmt.Errorf("指定 CDN 不可用：%s", preferred)
+		return []string{trimSlash(preferred)}
 	}
-	var lastErr error
-	for _, base := range defaultCDNCandidates {
-		if headOK(client, latestFeedURL(base)) {
-			fmt.Println("CDN 可用：", base)
-			return base, nil
-		}
-		lastErr = fmt.Errorf("探测失败：%s", base)
-		fmt.Println("CDN 不可用：", base)
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("无候选")
-	}
-	return "", fmt.Errorf("没有可用的 CDN。请使用 -cdn <地址> 指定，或检查网络：%w", lastErr)
+	return defaultCDNCandidates
 }
 
-func resolveBase(client *http.Client, version, preferred string) (string, error) {
-	if preferred != "" {
-		preferred = trimSlash(preferred)
-		u := preferred + "/" + version + "/manifest-" + platformArch + ".json"
-		resp, err := fetchOK(client, u)
+func resolveRelease(client *http.Client, version, preferred string) (string, release, error) {
+	var failures []string
+	for _, base := range cdnCandidates(preferred) {
+		r, err := fetchRelease(client, base, version)
 		if err != nil {
-			return "", fmt.Errorf("指定 CDN 不可用：%w", err)
-		}
-		_ = resp.Body.Close()
-		fmt.Println("CDN 可用（指定）：", preferred)
-		return preferred, nil
-	}
-	var lastErr error
-	for _, base := range defaultCDNCandidates {
-		u := base + "/" + version + "/manifest-" + platformArch + ".json"
-		resp, err := fetchOK(client, u)
-		if err != nil {
-			fmt.Println("CDN 不可用：", base, err.Error())
-			lastErr = err
+			fmt.Println("CDN 不可用：", base, err)
+			failures = append(failures, err.Error())
 			continue
 		}
-		_ = resp.Body.Close()
 		fmt.Println("CDN 可用：", base)
-		return base, nil
+		return base, r, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("无候选")
-	}
-	return "", fmt.Errorf("没有可用的 CDN。请使用 -cdn <地址> 指定，或检查网络：%w", lastErr)
+	return "", release{}, fmt.Errorf("没有可用的 CDN：%s", strings.Join(failures, "; "))
 }
 
+// Linux update feeds can disappear while remote-server assets remain available.
+// Try the desktop platforms as independent version-discovery sources.
 func fetchLatestFromFeed(client *http.Client, cdnBase string) (string, error) {
-	resp, err := fetchOK(client, latestFeedURL(cdnBase))
-	if err != nil {
-		return "", err
+	var versions []string
+	var failures []string
+	for _, feed := range []string{"update/linux/x64/latest-linux.yml", "update/win32/x64/latest.yml", "update/darwin/arm64/latest-mac.yml"} {
+		u := trimSlash(cdnBase) + "/" + feed
+		resp, err := fetchOK(client, u)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		m := ymlVersionRE.FindSubmatch(body)
+		if m == nil {
+			failures = append(failures, u+": 未找到 version")
+			continue
+		}
+		versions = append(versions, string(m[1]))
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	if len(versions) == 0 {
+		return "", fmt.Errorf("%s", strings.Join(failures, "; "))
 	}
-	m := ymlVersionRE.FindSubmatch(body)
-	if m == nil {
-		return "", fmt.Errorf("latest-linux.yml 中未找到 version")
-	}
-	return string(m[1]), nil
+	sort.Slice(versions, func(i, j int) bool { return versionLess(versions[j], versions[i]) })
+	return versions[0], nil
 }
 
 func fetchChangelogVersions(client *http.Client) []string {
@@ -325,7 +296,7 @@ func expandVersionCandidates(seed []string, latest string) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	add := func(v string) {
-		if !versionDirRE.MatchString(v) {
+		if !releaseVersionRE.MatchString(v) {
 			return
 		}
 		if _, ok := seen[v]; ok {
@@ -353,37 +324,17 @@ func expandVersionCandidates(seed []string, latest string) []string {
 		}
 	}
 	for k, maxPatch := range groups {
+		// Seeds still include their exact version; bound speculative patch probes.
+		if maxPatch > 100 {
+			maxPatch = 100
+		}
 		for patch := 0; patch <= maxPatch; patch++ {
 			add(fmt.Sprintf("%d.%d.%d", k.major, k.minor, patch))
 		}
 	}
 
-	// 从 latest 所在 major 往回补齐各 minor 的常见 patch（changelog 可能只展示部分）
-	if latest != "" {
-		p := parseVersionParts(latest)
-		for len(p) < 3 {
-			p = append(p, 0)
-		}
-		major, minor, latestPatch := p[0], p[1], p[2]
-		for m := 0; m <= minor; m++ {
-			maxPatch := 20
-			if m == minor {
-				maxPatch = latestPatch
-			}
-			for patch := 0; patch <= maxPatch; patch++ {
-				add(fmt.Sprintf("%d.%d.%d", major, m, patch))
-			}
-		}
-		// 再探上一个 major 的近期 minor（有限范围，避免漏掉 2.x 等）
-		if major > 0 {
-			prevMajor := major - 1
-			for m := 0; m <= 30; m++ {
-				for patch := 0; patch <= 12; patch++ {
-					add(fmt.Sprintf("%d.%d.%d", prevMajor, m, patch))
-				}
-			}
-		}
-	}
+	// Do not enumerate unknown major/minor series: stale mirror feeds otherwise
+	// generate hundreds of unrelated requests before current releases appear.
 	return out
 }
 
@@ -397,9 +348,11 @@ func listLocalVersions(releasesRoot string) map[string]bool {
 		if !e.IsDir() || !versionDirRE.MatchString(e.Name()) {
 			continue
 		}
-		mp := filepath.Join(releasesRoot, e.Name(), "manifest-"+platformArch+".json")
-		if _, err := os.Stat(mp); err == nil {
-			out[e.Name()] = true
+		for _, name := range manifestNames {
+			if _, err := os.Stat(filepath.Join(releasesRoot, e.Name(), name)); err == nil {
+				out[e.Name()] = true
+				break
+			}
 		}
 	}
 	return out
@@ -422,8 +375,8 @@ func probeRemoteVersions(client *http.Client, cdnBase string, candidates []strin
 		go func() {
 			defer wg.Done()
 			for ver := range jobs {
-				u := trimSlash(cdnBase) + "/" + ver + "/manifest-" + platformArch + ".json"
-				results <- result{version: ver, ok: headOK(client, u)}
+				_, err := fetchRelease(client, cdnBase, ver)
+				results <- result{version: ver, ok: err == nil}
 			}
 		}()
 	}
@@ -448,43 +401,54 @@ func probeRemoteVersions(client *http.Client, cdnBase string, candidates []strin
 	return found
 }
 
-func runListVersions(cdnPreferred, releasesRoot string) error {
+func runListVersions(cdnPreferred, releasesRoot, versionSeed string) error {
 	client := probeClient()
-	cdnBase, err := resolveCDNBase(client, cdnPreferred)
-	if err != nil {
-		return err
-	}
-
-	latest, err := fetchLatestFromFeed(client, cdnBase)
-	if err != nil {
-		fmt.Println("警告：无法读取 latest-linux.yml：", err.Error())
-	} else {
-		fmt.Println("最新版本（update feed）：", latest)
-	}
-
-	fmt.Println("正在收集候选版本（changelog + 同系列补齐）...")
-	seed := fetchChangelogVersions(client)
-	candidates := expandVersionCandidates(seed, latest)
-	sort.Slice(candidates, func(i, j int) bool {
-		return versionLess(candidates[j], candidates[i])
-	})
-	fmt.Printf("候选 %d 个，正在探测 CDN 上是否存在 manifest-%s.json ...\n", len(candidates), platformArch)
-
-	found := probeRemoteVersions(client, cdnBase, candidates)
 	local := listLocalVersions(releasesRoot)
+	seed := fetchChangelogVersions(client)
+	if versionSeed != "" {
+		seed = append(seed, versionSeed)
+	}
+	for version := range local {
+		seed = append(seed, version)
+	}
+	var found []string
+	var availableBases []string
+	seen := map[string]bool{}
+	for _, base := range cdnCandidates(cdnPreferred) {
+		feedVersion, err := fetchLatestFromFeed(client, base)
+		if err != nil {
+			fmt.Println("警告：更新 feed 不可用，继续使用 changelog / 本地版本探测：", err)
+		}
+		candidates := expandVersionCandidates(seed, feedVersion)
+		if len(candidates) == 0 {
+			continue
+		}
+		fmt.Printf("正在探测 %s 的 %d 个候选版本（新旧清单）...\n", base, len(candidates))
+		versions := probeRemoteVersions(client, base, candidates)
+		if len(versions) > 0 {
+			availableBases = append(availableBases, base)
+		}
+		for _, version := range versions {
+			if !seen[version] {
+				found = append(found, version)
+				seen[version] = true
+			}
+		}
+	}
+	if len(found) == 0 {
+		return fmt.Errorf("未找到可用的 %s 资源清单；更新 feed 不可用不代表 CDN 离线。可直接使用 -version <客户端版本> 下载，或用 -cdn 指定 releases 根地址", platformArch)
+	}
+	sort.Slice(found, func(i, j int) bool { return versionLess(found[j], found[i]) })
+	cdnBase := strings.Join(availableBases, ", ")
 
 	fmt.Println()
 	fmt.Println("CDN 根     :", cdnBase)
 	fmt.Println("目标平台   :", platformArch)
 	fmt.Printf("远程可用   : %d 个版本\n", len(found))
 	fmt.Println()
-	if len(found) == 0 {
-		fmt.Println("（未探测到带 linux-x64 manifest 的版本）")
-		return nil
-	}
 	for _, ver := range found {
 		tags := make([]string, 0, 2)
-		if latest != "" && ver == latest {
+		if ver == found[0] {
 			tags = append(tags, "latest")
 		}
 		if local[ver] {
@@ -572,51 +536,78 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func ensureArtifact(client *http.Client, releasesRoot, cdnBase string, c component, force bool) error {
-	dest := filepath.Join(append([]string{releasesRoot}, strings.Split(c.ArtifactPath, "/")...)...)
-	expected := strings.TrimSpace(c.Sha256)
-
-	if !force {
-		if st, err := os.Stat(dest); err == nil && !st.IsDir() {
-			if expected != "" {
-				actual, err := sha256File(dest)
-				if err != nil {
-					return err
-				}
-				if actual == expected {
-					fmt.Printf("[跳过] %s sha256 校验通过（%.1f MB）\n", c.ID, float64(st.Size())/1048576)
-					return nil
-				}
-				fmt.Printf("[重新下载] %s sha256 不匹配 期望=%s 实际=%s\n", c.ID, expected, actual)
-			} else {
-				fmt.Printf("[跳过] %s 本地已存在\n", c.ID)
-				return nil
-			}
-		}
-	}
-
-	rawURL := cdnBase + "/" + encodePath(c.ArtifactPath)
-	forceTag := ""
-	if force {
-		forceTag = "（强制）"
-	}
-	fmt.Printf("[下载] %s%s\n", c.ID, forceTag)
-	fmt.Println(" ", rawURL)
-	fmt.Println("  ->", dest)
-	if err := downloadTo(client, rawURL, dest); err != nil {
+func verifyArtifact(file string, c component) error {
+	st, err := os.Stat(file)
+	if err != nil {
 		return err
 	}
-	if expected != "" {
-		actual, err := sha256File(dest)
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("资源不是普通文件：%s", file)
+	}
+	if c.SizeBytes > 0 && st.Size() != c.SizeBytes {
+		return fmt.Errorf("%s 大小不匹配：期望=%d 实际=%d", c.ID, c.SizeBytes, st.Size())
+	}
+	if expected := strings.TrimSpace(c.Sha256); expected != "" {
+		actual, err := sha256File(file)
 		if err != nil {
 			return err
 		}
 		if actual != expected {
 			return fmt.Errorf("%s 的 sha256 不匹配：期望=%s 实际=%s", c.ID, expected, actual)
 		}
-		fmt.Println("  sha256 校验通过")
 	}
 	return nil
+}
+
+func ensureArtifact(client *http.Client, releasesRoot, cdnBase string, c component, force bool) error {
+	if !safeAssetPath(c.ArtifactPath) {
+		return fmt.Errorf("无效的 artifactPath：%q", c.ArtifactPath)
+	}
+	dest := filepath.Join(releasesRoot, filepath.FromSlash(c.ArtifactPath))
+	if !force {
+		if err := verifyArtifact(dest, c); err == nil {
+			fmt.Printf("[跳过] %s 本地校验通过\n", c.ID)
+			return nil
+		}
+	}
+	urls := []string{trimSlash(cdnBase) + "/" + encodePath(c.ArtifactPath)}
+	if len(c.URLs) > 0 {
+		urls = nil
+		for _, ref := range c.URLs {
+			u, err := archiveURL(cdnBase, c.SourceVersion, ref)
+			if err != nil {
+				return err
+			}
+			urls = append(urls, u)
+		}
+	}
+	// Verify a staged download before replacing an existing valid cache file.
+	staged := dest + ".download"
+	defer os.Remove(staged)
+	var failures []string
+	for _, rawURL := range urls {
+		fmt.Printf("[下载] %s\n  %s\n  -> %s\n", c.ID, rawURL, dest)
+		if err := downloadTo(client, rawURL, staged); err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if err := verifyArtifact(staged, c); err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		// Windows does not allow Rename to overwrite an existing destination.
+		if runtime.GOOS == "windows" {
+			if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		if err := os.Rename(staged, dest); err != nil {
+			return err
+		}
+		fmt.Println("  校验通过")
+		return nil
+	}
+	return fmt.Errorf("%s 下载失败：%s", c.ID, strings.Join(failures, "; "))
 }
 
 func writeSha256Sums(offlineRoot string, m manifest) error {
@@ -626,7 +617,7 @@ func writeSha256Sums(offlineRoot string, m manifest) error {
 	b.WriteString(" / ")
 	b.WriteString(platformArch)
 	b.WriteString(" 组件压缩包 SHA256\n")
-	b.WriteString("# 与 manifest.components[].sha256 一致\n\n")
+	b.WriteString("# 与资源清单中的 sha256 一致；路径相对于 zcode/electron/releases/\n\n")
 	for _, c := range m.Components {
 		b.WriteString(c.Sha256)
 		b.WriteString("  ")
@@ -676,7 +667,7 @@ func printHelp() {
   go run . [选项]          # 仅开发
 
 选项：
-  -list, -l                列出 CDN 上可用的版本（探测 manifest-linux-x64.json）
+  -list, -l                列出 CDN 可用版本（可用 -version 补充候选）
   -version, -v <版本号>   要拉取的应用版本（默认：offline 中已有的最高版本）
   -cdn <地址>             强制指定 CDN releases 根地址（跳过自动探测）
   -force, -f              即使本地 sha256 已匹配也强制重新下载
@@ -750,7 +741,7 @@ func main() {
 	releasesRoot := filepath.Join(offlineRoot, "zcode", "electron", "releases")
 
 	if list {
-		if err := runListVersions(cdn, releasesRoot); err != nil {
+		if err := runListVersions(cdn, releasesRoot, version); err != nil {
 			fatal(err)
 		}
 		return
@@ -770,47 +761,27 @@ func main() {
 	fmt.Println("强制下载     :", force)
 
 	client := httpClient()
-	cdnBase, err := resolveBase(client, version, cdn)
+	cdnBase, selected, err := resolveRelease(client, version, cdn)
 	if err != nil {
 		fatal(err)
 	}
-
-	manifestPath := filepath.Join(releasesRoot, version, "manifest-"+platformArch+".json")
-	manifestURL := cdnBase + "/" + version + "/manifest-" + platformArch + ".json"
-	fmt.Println("[下载] 清单", manifestURL)
-
-	resp, err := fetchOK(client, manifestURL)
-	if err != nil {
-		fatal(err)
-	}
-	mText, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
-		fatal(err)
-	}
-	if err := os.WriteFile(manifestPath, mText, 0o644); err != nil {
-		fatal(err)
-	}
-
-	var fresh manifest
-	if err := json.Unmarshal(mText, &fresh); err != nil {
-		fatal(err)
-	}
-	if fresh.PlatformArch != platformArch {
-		fatal(fmt.Errorf("platformArch 不匹配：实际=%s 期望=%s", fresh.PlatformArch, platformArch))
-	}
-	if fresh.AppVersion != version {
-		fatal(fmt.Errorf("appVersion 不匹配：实际=%s 期望=%s", fresh.AppVersion, version))
-	}
+	fresh := selected.Manifest
+	manifestPath := filepath.Join(releasesRoot, version, selected.Name)
+	// Publish the manifest only after all referenced components passed validation.
 
 	for _, c := range fresh.Components {
 		if err := ensureArtifact(client, releasesRoot, cdnBase, c, force); err != nil {
 			fatal(err)
 		}
 	}
+
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, selected.Data, 0o644); err != nil {
+		fatal(err)
+	}
+	fmt.Println("[写入] 清单", manifestPath)
 
 	if err := writeSha256Sums(offlineRoot, fresh); err != nil {
 		fatal(err)
