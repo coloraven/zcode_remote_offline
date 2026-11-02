@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "version": "3.16.3",
+  "archives": [
+    {
+      "target": "linux-x64",
+      "version": "3.16.3",
+      "fileName": "zcode-server-linux-x64.tar.gz",
+      "sha256": "5062d871bd2ad2ddd1b44d6463bd9159af5b493be93845ffc7163dd5b5d45375",
+      "sizeBytes": 91199722,
+      "urls": [
+        "zcode-server-linux-x64.tar.gz"
+      ]
+    },
+    {
+      "target": "linux-arm64",
+      "version": "3.16.3",
+      "fileName": "zcode-server-linux-arm64.tar.gz",
+      "sha256": "a57ac9aac4ac9c5d5eef361b711e2423289e764fbd4cb13879e163dd9d96698b",
+      "sizeBytes": 90149728,
+      "urls": [
+        "zcode-server-linux-arm64.tar.gz"
+      ]
+    },
+    {
+      "target": "darwin-x64",
+      "version": "3.16.3",
+      "fileName": "zcode-server-darwin-x64.tar.gz",
+      "sha256": "053977c08b27fa425d789d44ec1acb10b401c9f7aeb78b95a3a2c499285294b8",
+      "sizeBytes": 82021733,
+      "urls": [
+        "zcode-server-darwin-x64.tar.gz"
+      ]
+    },
+    {
+      "target": "darwin-arm64",
+      "version": "3.16.3",
+      "fileName": "zcode-server-darwin-arm64.tar.gz",
+      "sha256": "0af9fa5ab356fe2d9295ad741e95e35fac09ca85d6fbd4126d3032e25ecf1506",
+      "sizeBytes": 79945904,
+      "urls": [
+        "zcode-server-darwin-arm64.tar.gz"
+      ]
+    }
+  ]
+}

@@ -14,7 +14,7 @@ resources/
 ├── online/                         ← 本目录（有网维护）
 │   ├── README.md
 │   ├── go.mod
-│   └── main.go                     ← Go 下载工具（唯一实现）
+│   └── main.go / release.go        ← Go 下载工具
 └── offline/                        ← 下载目标 / 离线分发包
     ├── README.md
     ├── main.go / go.mod              ← CDN 服务本体
@@ -44,6 +44,7 @@ resources/
 # 列出 CDN 上可用版本（并标注本地是否已有）
 .\download-offline-assets_windows_amd64.exe -list
 
+.\download-offline-assets_windows_amd64.exe -version 3.16.3
 .\download-offline-assets_windows_amd64.exe -version 3.4.2
 .\download-offline-assets_windows_amd64.exe -version 3.5.0 -force
 .\download-offline-assets_windows_amd64.exe -version 3.4.2 -cdn https://cdn-zcode.z.ai/zcode/electron/releases
@@ -53,12 +54,14 @@ resources/
 ```bash
 chmod +x download-offline-assets_linux_amd64
 ./download-offline-assets_linux_amd64 -list
-./download-offline-assets_linux_amd64 -version 3.4.2
+./download-offline-assets_linux_amd64 -version 3.16.3
 ```
 
 不传 `-version` 时，会尝试使用 `offline` 里已有的最高版本。
 
-> `-list` 会读取 update feed / changelog 收集候选，再探测各版本是否存在 `manifest-linux-x64.json`（CDN 本身无目录索引）。
+> `-list` 会读取 update feed / changelog 收集候选，再探测实际资源清单（CDN 本身无目录索引，列表不保证包含所有历史版本）。Linux update feed 返回 404 时，会尝试其他桌面平台的 feed；所有 feed 都不可用时，仍会使用 changelog 和本地版本继续探测。
+>
+> 已知客户端版本时，可以直接下载，不需要先运行 `-list`；也可以用 `-list -version 3.16.3` 补充候选版本。若没有发现任何有效清单，命令会以非零状态退出，并显示具体请求地址和错误。
 
 ---
 
@@ -76,17 +79,28 @@ go build -trimpath -ldflags="-s -w" -o download-offline-assets.exe .
 
 ## 工具会做什么
 
-1. 从 CDN 下载 `manifest-linux-x64.json` → `offline/zcode/electron/releases/<version>/`
-2. 按 manifest 下载全部组件 `.tar.gz` → `offline/zcode/electron/releases/components/linux-x64/...`
-3. 用组件 `sha256` 校验本地文件
+1. 优先读取 `<version>/source-server-release.json`（3.16.1 起的新格式）；不存在（404/410）时回退到 `manifest-linux-x64.json`
+2. 新格式选择 `archives` 中 `target = linux-x64` 的完整 server 包，按清单 `urls` 下载，保存到 `<version>/<fileName>`；旧格式继续下载 `components` 下的组件包
+3. 按清单校验 SHA256，新格式同时校验 `sizeBytes`；缓存校验通过时跳过下载，强制刷新失败时保留原缓存
 4. 更新 `offline/sha256sums-linux-x64.txt`
+
+清单仅在所需资源全部下载并校验成功后写入。官方新版使用相对 URL，清单原样保留；如果清单提供多个镜像或绝对 URL，下载器会依次尝试，并将所选 Linux x64 条目的 URL 改为本地文件名，供离线客户端使用。其他平台的包不会下载。
 
 对应线上路径：
 
 | 资源 | URL 形态 |
 |------|----------|
-| 清单文件 | `{CDN}/<version>/manifest-linux-x64.json` |
-| 组件包 | `{CDN}/components/linux-x64/<id>/<version>.tar.gz` |
+| 新版清单（3.16.1+） | `{CDN}/<version>/source-server-release.json` |
+| 新版完整包 | `{CDN}/<version>/zcode-server-linux-x64.tar.gz`（以清单 `urls` 为准） |
+| 旧版清单 | `{CDN}/<version>/manifest-linux-x64.json` |
+| 旧版组件包 | `{CDN}/components/linux-x64/<id>/<version>.tar.gz` |
+
+校验清单中的路径以 `offline/zcode/electron/releases/` 为根：
+
+```bash
+cd ../offline/zcode/electron/releases
+sha256sum -c ../../../sha256sums-linux-x64.txt
+```
 
 ---
 
@@ -106,7 +120,17 @@ go build -trimpath -ldflags="-s -w" -o download-offline-assets.exe .
 
 ### 报错「没有可用的 CDN」
 
-检查网络，或用 `-cdn` 指定可达的 releases 根地址。
+查看错误中的完整请求地址和 HTTP 状态。更新 feed 的 404 与资源清单的 404 含义不同；前者不代表整个 CDN 不可用。
+
+已知客户端版本时，先直接指定版本，跳过 feed 发现：
+
+```bash
+./download-offline-assets_linux_amd64 -version 3.16.3
+# 或指定可达的 releases 根地址（不带版本号/清单文件名）
+./download-offline-assets_linux_amd64 -version 3.16.3 -cdn https://cdn-zcode.z.ai/zcode/electron/releases
+```
+
+版本号必须与已安装客户端一致。如果所有新旧清单地址均为 404，该镜像可能尚未发布或已移除这个版本，需换可用 CDN 或提供对应资源。
 
 ### 报错「appVersion 不匹配」
 

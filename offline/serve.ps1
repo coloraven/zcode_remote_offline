@@ -16,7 +16,8 @@ function Get-OfflineVersions {
   Get-ChildItem -LiteralPath $Releases -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match '^\d+\.\d+\.\d+' } |
     ForEach-Object {
-      $manifests = Get-ChildItem -LiteralPath $_.FullName -Filter 'manifest-*.json' -File -ErrorAction SilentlyContinue
+      $manifests = Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'manifest-*.json' -or $_.Name -eq 'source-server-release.json' }
       if ($manifests) {
         [pscustomobject]@{
           Version   = $_.Name
